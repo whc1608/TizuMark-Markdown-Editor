@@ -106,6 +106,13 @@
             }
           });
         }
+        // 「上一级」按钮点击 = 把工作区切换到上级目录
+        const folderUpEl = document.getElementById('folder-up');
+        if (folderUpEl) {
+          folderUpEl.addEventListener('click', async () => {
+            await this.goToParentWorkspace();
+          });
+        }
         // 大纲面板标题（左侧图标+文字）点击等效于点击折叠按钮
         if (outlineHeader) {
           outlineHeader.addEventListener('click', () => this.togglePanel('outline'));
