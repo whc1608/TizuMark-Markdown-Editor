@@ -258,6 +258,19 @@ function guardMathBlocks(content) {
   let inCodeTag = false;
 
   while (i < len) {
+    // 行内代码跨度不能跨行（CommonMark：backtick string 不能包含行结束符）：反引号状态
+    // 必须是行局部的。全篇累积曾在某行游离的奇数反引号处翻转 inBacktick，使其后整篇
+    // 「反引号内的 $...$」全部被误判为数学（2026-07-13 demo.md 审计：L963 转义表格的
+    // \`` 未正确处理 → L1034 反引号内 $...$ 变 MATHBLOCK 占位 → remark 渲染成转义
+    // <code> 后 restore 匹配不到 → 阅读模式残留 <!--MATHBLOCK_N--> 字面垃圾文本）。
+    if (content[i] === '\n' || content[i] === '\r') {
+      inBacktick = false;
+      inDoubleBacktick = false;
+      result += content[i];
+      i++;
+      continue;
+    }
+
     // Track fenced code blocks (3+ backticks)
     if (content[i] === '`') {
       let btCount = 1;
@@ -321,6 +334,16 @@ function guardMathBlocks(content) {
     if (inDoubleBacktick) {
       result += content[i];
       i++;
+      continue;
+    }
+
+    // 反斜杠转义：`\` + ASCII 标点 = 字面字符（CommonMark）。只接管两个有状态机语义的
+    // 定界符：`\`` 是字面反引号、不是代码定界符（绝不能翻转 inBacktick——demo.md L963
+    // 转义表格的 \`` 曾在此翻转状态，污染其后整篇）；`\$` 是字面美元、不是数学开始。
+    // 其余反斜杠（含 \( \[ 的 LaTeX 定界符、\\ 自身）仍走后续原有分支。
+    if (content[i] === '\\' && i + 1 < len && (content[i + 1] === '`' || content[i + 1] === '$')) {
+      result += content[i] + content[i + 1];
+      i += 2;
       continue;
     }
 
@@ -752,9 +775,17 @@ function convertAlerts(content) {
       // 将 END 标记附着到最后一行内容末尾，避免增加额外行
       if (contentLines.length > 0) {
         contentLines[contentLines.length - 1] += '<!--ALERTBLOCK_' + idx + '_END-->';
+        result.push('<!--ALERTBLOCK_' + idx + '-->');
+        result.push(contentLines.join('\n'));
+      } else {
+        // 空提示块（`> [!TYPE]` 后面没有内容行）：两端标记必须**成对**输出。
+        // restoreAlerts 要求 startPos/endPos 同时命中，缺 END 会把整块丢弃 —— 预览里只写
+        // 一行的 `> [!NOTE]` 会凭空消失；WYSIWYG 编辑态「上段只有标记行」（光标停在紧跟
+        // 标记行的第一行正文上）同样因此渲染不出标题行（用户 2026-10-25 截图：编辑态
+        // 提示块没有「Note」标题、与渲染态结构不一致）。
+        result.push('<!--ALERTBLOCK_' + idx + '-->');
+        result.push('<!--ALERTBLOCK_' + idx + '_END-->');
       }
-      result.push('<!--ALERTBLOCK_' + idx + '-->');
-      result.push(contentLines.join('\n'));
     } else {
       result.push(line);
       i++;
@@ -1634,6 +1665,7 @@ function normalizeListIndentation(content, tabSize) {
   let inFence = false;
   let fenceMarker = '';
   let prevEmittedDepth = 0; // 上一个已输出列表项的嵌套深度（0 = 无）
+  let prevQuoteLvl = 0;    // 上一个已输出引用行的层级（> 计数；非引用行重置 0）
 
   const expand = (s) => s.replace(/\t/g, ' '.repeat(ts));
 
@@ -1642,6 +1674,7 @@ function normalizeListIndentation(content, tabSize) {
     // —— 围栏代码块：进入/离开均跳过归一化 ——
     const fenceMatch = line.match(/^(\s*)(`{3,}|~{3,})/);
     if (fenceMatch) {
+      prevQuoteLvl = 0; // 围栏行结束引用上下文
       const marker = fenceMatch[2][0];
       const len = fenceMatch[2].length;
       if (!inFence) {
@@ -1655,8 +1688,25 @@ function normalizeListIndentation(content, tabSize) {
       continue;
     }
     if (inFence) {
+      prevQuoteLvl = 0;
       emit(line, origLine++);
       continue;
+    }
+
+    // —— 引用层级回退（2026-10-28 S91 用户②）：某引用行层级比上一引用行浅（如
+    // `> > > c` 后 `> d`）时，CommonMark「惰性延续」会把 d 并进最内层打开的段落
+    // （实测：d 渲染在嵌套盒 P 内、而非用户输入的位置 = 用户反馈「输入内容之后
+    // 渲染态展示不出来」）。在其前插一行目标层级的空引用行（'>' × L）：强制更深层
+    // 盒闭合——该空行不产生任何节点、也不产生空 <p>（3→1 / 3→2 / 2→1→2 全实测），
+    // 渲染即与编辑态的层级感知分块（wysiwyg 块表/分段口径、S83「编辑态=渲染态」）
+    // 一致。插入行映射到下一行同一原始行号（与上方有序嵌套空行前插同口径）。
+    const qm = line.match(/^\s{0,3}(?:>[ \t]?)+/);
+    if (qm) {
+      const qLvl = (qm[0].match(/>/g) || []).length;
+      if (qLvl < prevQuoteLvl) emit('>'.repeat(qLvl), origLine);
+      prevQuoteLvl = qLvl;
+    } else {
+      prevQuoteLvl = 0;
     }
 
     const m = line.match(itemRe);
@@ -1836,8 +1886,223 @@ function renderMarkdown(content, options) {
   return html;
 }
 
+// 按顶层块切分并逐块渲染（所见即所得遮罩专用，见 src/modules/wysiwyg.js）。
+//
+// ⚠️ 块边界必须来自 remark 解析器本身（与阅读模式同一套解析），
+// 不允许再用手写行级切块器：它与 CommonMark 的边界存在系统性偏差——
+// 实测 `1.` 单独成行 + 缩进内容会被拆成两块，渲染出「空列表项（只剩序号）+ 独立段落」，
+// 与阅读模式完全对不上（2026-10-07 真机反馈「带有序号的空行」）。
+// 用解析器的 node.position 切源码，再对每块走完整 renderMarkdown 管线，
+// 保证逐块渲染结果与阅读模式对同一区域的渲染一致。
+// 已知局限：链接引用定义 / 脚注定义跨块引用时，单块渲染拿不到别块的定义（整篇渲染才有）。
+//
+// options.maxBlocks：块数超过该值时跳过逐块渲染（html 置空 + skipped 标记），
+// 供调用方（wysiwyg 大文档模式）按视口按需渲染——18k 行文档每次停顿都全量渲染会卡。
+// options.skipHtml：只切块边界不渲染 html（同样置 skipped 标记）——wysiwyg 全量模式
+// 输入后的增量刷新只需新块边界（既有遮罩按 marker.find() 自动跟随文本，仅重挂变化块）。
+// options.maxBlocks: Infinity：一块不跳（全量预渲染，wysiwyg ≤10000 行进入时的后台步骤）。
+// 链接引用定义行：`[label]: 目标 "可选标题"`（CommonMark；行首缩进 ≤3 空格）。
+// 整篇渲染时定义被引用链接消费、不进正文；逐块渲染时定义单独成块、remark 输出为空——
+// 若按空 html 处理，遮罩会被跳过、定义行以源码裸露（真机「所见即所得里 [ref-example]: URL
+// 出现、阅读模式没有」，2026-10-11 用户反馈）。故整块都是定义行的块改输出零高度占位，
+// 让遮罩把该行盖掉（与阅读模式可见性一致，同缩写定义单独成块的处理思路）。
+const REF_DEF_LINE = /^\s{0,3}\[[^\[\]]+\]:\s*\S+(\s+("[^"]*"|'[^']*'|\([^)]*\)))?\s*$/;
+function isOnlyLinkRefDefs(slice) {
+  const ls = String(slice || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  let has = false;
+  for (const ln of ls) {
+    if (!ln.trim()) continue;
+    if (!REF_DEF_LINE.test(ln)) return false;
+    has = true;
+  }
+  return has;
+}
+
+// 裸闭合标签行（如孤立的 `</p>` / `</details>`）：remark 把这类行切成 type-7 HTML 块，
+// 渲染为空（阅读模式不可见）；逐块渲染同样为空——若按空 html 处理，遮罩被跳过、
+// 该行以源码裸露在 WYSIWYG 里（阅读模式没有 → 不一致，demo.md 尾部 `</p>` 行实测）。
+// 与链接引用定义同法：整块都是孤闭合标签行 → 输出零高度占位，让遮罩把行盖掉。
+const STRAY_CLOSE_TAG_LINE = /^\s{0,3}<\s*\/[a-zA-Z][a-zA-Z0-9]*\s*>\s*$/;
+function isOnlyStrayClosingTags(slice) {
+  const ls = String(slice || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  let has = false;
+  for (const ln of ls) {
+    if (!ln.trim()) continue;
+    if (!STRAY_CLOSE_TAG_LINE.test(ln)) return false;
+    has = true;
+  }
+  return has;
+}
+
+// 未闭合裸 HTML 容器标签合并白名单——按真实管线（rehype-sanitize + parse5 全串重解析）
+// 逐标签实测（2026-07-13，_work/audit-4）：这些标签的「开标签行 + 空行 + 后续内容 +
+// 闭标签行」在**阅读模式**会被 parse5 并进同一个元素（如 demo.md 的 <details> 折叠块：
+// 阅读是一个含列表的完整折叠框）。而 remark 按 CommonMark 遇空行即断 HTML 块，WYSIWYG
+// 逐块遮罩各自渲染 → 显示「空壳容器 + 独立内容 + 裸露闭标签源码行」，与阅读不一致。
+// 故块表里把这类节点向后并到闭标签行，让块切片与阅读看到同一完整元素。
+// 不在名单（实测不合并）：p（浏览器遇下一个块级开标签即隐式闭合）、table/tr/th/td/
+// tbody/thead/tfoot（parse5 表格解析特殊，片段化输出）、form/html（rehype-sanitize 剥除
+// 开标签）——这些阅读与逐块同样片段化，天然一致，无需合并。pre/script/style/textarea
+// 是 type-4 块（remark 本就连闭标签一起成块），也不涉及。
+const OPEN_CONTAINER_TAGS = new Set([
+  'address', 'article', 'aside', 'blockquote', 'center', 'dd', 'details', 'dialog',
+  'dir', 'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure', 'footer',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'li', 'main', 'menu', 'nav',
+  'noframes', 'ol', 'section', 'summary', 'ul',
+]);
+
+function renderMarkdownBlocks(content, options) {
+  const mdRaw = String(content == null ? '' : content);
+  if (!mdRaw.trim()) return [];
+  // 与 renderMarkdown 主流程一致：先统一换行，避免 \r 污染行首判定与行数
+  const md = mdRaw.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = md.split('\n');
+  // ⚠️ 必须先经 guardMathBlocks 保护公式区再做 remark 解析切块（与 renderMarkdown 主流程同一保护）：
+  // 展示公式内部可以含「长得像 CommonMark 语法」的行——如矩阵乘法里的 `=` 行，remark 会把它当
+  // setext 标题下划线，把公式劈成两半，前半渲染成一个装着公式源码的巨型 h1（真机 demo.md
+  // 实测，2026-10-08 用户截图反馈）；`---` 变 hr、`# x` 变标题同理。受保护内容里公式被替换为
+  // 占位 div（行数由补行保持），remark 不再误解析公式内部语法；占位 div 只占第一行（HTML 块
+  // 遇空行即断），故下面再按占位符的 line/text 把展示公式的完整行段并回一个整块。
+  const mathResult = guardMathBlocks(md);
+  let tree;
+  try {
+    tree = unified()
+      .use(remarkParse)
+      .use(remarkGfm, { singleTilde: false })
+      .parse(mathResult.content);
+  } catch (e) {
+    console.error('renderMarkdownBlocks: 解析失败，交由调用方回退:', e);
+    return null;
+  }
+  const children = (tree && tree.children) || [];
+  const skipHtml = !!(options && options.maxBlocks && children.length > options.maxBlocks);
+  // 先只收块范围（不渲染 html）：公式行段合并之后 slice 才最终确定
+  const blocks = [];
+  for (const node of children) {
+    if (!node || !node.position) continue;
+    const start = node.position.start.line - 1; // 0-based
+    const end = node.position.end.line;         // 开区间
+    if (end <= start || start < 0 || end > lines.length) continue;
+    // 紧凑列表按项切块（2026-10-21 用户反馈「光标在列表某项，兄弟项也显示源码」——
+    // 应只显示光标所在列表项的源码，兄弟项保持渲染态）：块内**无空行**（紧凑列表）且
+    // 项数 > 1 时拆成逐项块，每个顶层项一个块（含其嵌套子项行段）。松散列表（项间空行）
+    // 不拆：空行是真实源行，拆项会把空行裸露成可见行、渲染间距改变，保持整块（= 用户
+    // 口径「所在块显示源码」）。逐项块的片段高度（li + 项间距 4px，末项 +14px 列表底距，
+    // 见 styles.css wysiwyg-mask-li-mid 规则与 S43 等高口径）与整列表遮罩对应区段逐像素
+    // 一致 → 渲染态外观与整块时完全相同，仅「点哪项哪项变源码」的粒度变细。
+    if (node.type === 'list') {
+      const items = (node.children || []).filter((c) => c && c.position);
+      const noBlank = !lines.slice(start, end).some((l) => (l || '').trim() === '');
+      if (noBlank && items.length > 1) {
+        items.forEach((li, k) => {
+          blocks.push({
+            start: li.position.start.line - 1,
+            end: li.position.end.line,
+            html: '',
+            skipped: skipHtml,
+            listItem: true,
+            listItemPos: (k === 0 ? 'first' : k === items.length - 1 ? 'last' : 'middle'),
+          });
+        });
+        continue;
+      }
+    }
+    blocks.push({ start, end, html: '', skipped: skipHtml });
+  }
+  // 展示公式行段并回：占位 div 的 line 是 1-based 起始行，text 是含定界符的公式全文，
+  // 行数 = text 换行数 + 1（与 guardMathBlocks 补的行数一致），整段必须作为一个块，
+  // 逐块渲染（renderMarkdown(slice)）才会走到同一套公式守卫，输出与阅读模式一致。
+  for (const ph of (mathResult.placeholders || [])) {
+    if (!ph || ph.display !== true || !ph.line) continue;
+    const s = ph.line - 1;
+    const e = Math.min(lines.length, s + String(ph.text || '').split('\n').length);
+    if (e <= s) continue;
+    let target = null;
+    for (const b of blocks) {
+      if (b.start <= s && s < b.end) { target = b; break; }
+    }
+    if (target) {
+      target.start = Math.min(target.start, s);
+      target.end = Math.max(target.end, e);
+    } else {
+      blocks.push({ start: s, end: e, html: '', skipped: skipHtml });
+    }
+  }
+  // 未闭合裸 HTML 容器合并（与上面公式区合并同位、同模式）：节点行段只到空行（CommonMark），
+  // 阅读模式 parse5 却把内容并进容器元素直到 </T>（见 OPEN_CONTAINER_TAGS 注释的实测）。
+  // 扫描闭标签行时跳过围栏代码块内部，避免代码里的 `</div>` 文本提前截断。
+  for (const node of children) {
+    if (!node || node.type !== 'html' || typeof node.value !== 'string' || !node.position) continue;
+    const val = node.value;
+    const first = val.split('\n').find((l) => l.trim());
+    const om = first && first.match(/^\s{0,3}<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*?)>/);
+    if (!om) continue;
+    const tag = om[1].toLowerCase();
+    if (!OPEN_CONTAINER_TAGS.has(tag)) continue;
+    if (om[2].trim().endsWith('/')) continue; // 自闭合
+    if (new RegExp('</' + tag + '[\\s>/]', 'i').test(val)) continue; // 块内已闭合
+    const start0 = node.position.start.line - 1;
+    const b = blocks.find((x) => x.start <= start0 && start0 < x.end);
+    if (!b) continue;
+    let fence = null;
+    let found = -1;
+    const cap = Math.min(lines.length, b.end + 600); // 上限防病态文档
+    for (let li = b.end; li < cap; li++) {
+      const ln = lines[li] || '';
+      const fm = ln.match(/^\s{0,3}(`{3,}|~{3,})/);
+      if (fm) {
+        if (!fence) fence = fm[1][0];
+        else if (fm[1][0] === fence) fence = null;
+        continue;
+      }
+      if (fence) continue;
+      if (new RegExp('^\\s{0,3}</' + tag + '\\b', 'i').test(ln)) { found = li + 1; break; }
+    }
+    if (found > b.end) b.end = found; // 后续重叠块由下面的相邻/重叠合并吃掉
+  }
+  blocks.sort((a, b) => a.start - b.start);
+  // 相邻/重叠段合并（两个公式区与同一块相交、或紧挨的两个区被同一节点覆盖时兜底）
+  for (let k = 1; k < blocks.length; k++) {
+    if (blocks[k].start < blocks[k - 1].end) {
+      blocks[k - 1].end = Math.max(blocks[k - 1].end, blocks[k].end);
+      blocks.splice(k, 1);
+      k--;
+    }
+  }
+  // 范围稳定后统一渲染（跳过空块）
+  const out = [];
+  for (const b of blocks) {
+    const slice = lines.slice(b.start, b.end).join('\n');
+    if (!slice.trim()) continue;
+    let html = '';
+    let renderFailed = false;
+    if (!b.skipped) {
+      try {
+        html = renderMarkdown(slice, options) || '';
+      } catch (e) {
+        console.error('renderMarkdownBlocks: 块渲染失败，该块保持源码态:', e);
+        html = '';
+        renderFailed = true;
+      }
+      // 渲染为空的「按设计不可见」块：链接引用定义 / 孤闭合标签行 → 输出零高度占位
+      // （遮罩盖行，与阅读模式可见性一致）。只在源文判定为纯此类行时替换，
+      // 渲染失败（同样为空）仍保持源码态可见。
+      if (html === '' && slice.trim() && !renderFailed &&
+          (isOnlyLinkRefDefs(slice) || isOnlyStrayClosingTags(slice))) {
+        html = '<div class="wysiwyg-block-hidden"></div>';
+      }
+    }
+    // listItem/listItemPos 是逐项列表块的标签（遮罩片段底距 / 活动块 edge-bottom 判定用），
+    // 必须随块传出——此处重建对象时漏掉会让下游拿到 undefined（2026-10-21 单测实测）。
+    out.push(b.listItem
+      ? { start: b.start, end: b.end, html, skipped: b.skipped, listItem: true, listItemPos: b.listItemPos }
+      : { start: b.start, end: b.end, html, skipped: b.skipped });
+  }
+  return out;
+}
+
 // Export for Node.js bundling; also expose as global for browser
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { renderMarkdown };
+  module.exports = { renderMarkdown, renderMarkdownBlocks };
 }
-return { renderMarkdown };
+return { renderMarkdown, renderMarkdownBlocks };

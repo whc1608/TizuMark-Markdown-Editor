@@ -64,19 +64,29 @@ test('slash: 空 query 显示全部命令', async () => withEditor({ captureInit
   assert.strictEqual(ed._slashFiltered.length, ed._buildSlashCommands().length, '空 query 应列出全部命令');
 }));
 
-test('slash: 列表已优选——上标/下标已移除，高频置顶', async () => withEditor({ captureInitErr: true }, async (w, ed) => {
+test('slash: 列表已优选——高频置顶、14 个内容类型补齐项默认不启用（2026-10-22）', async () => withEditor({ captureInitErr: true }, async (w, ed) => {
   const cmds = ed._buildSlashCommands();
-  // 上标/下标为纯 HTML 边缘标签，已从面板移除（手写即可）
-  assert.ok(!cmds.some((c) => c.action === 'insert-superscript'), '上标应已移除');
-  assert.ok(!cmds.some((c) => c.action === 'insert-subscript'), '下标应已移除');
-  assert.strictEqual(cmds.length, 28, '优选后应为 28 项，实际: ' + cmds.length);
+  const base = ed._slashBaseCatalog || [];
+  // 目录 = 28 项 + 内容类型补齐 14 项 = 42 项；默认隐藏 18 项（字体 4 + 新增 14）→ 面板显示 24 项
+  assert.strictEqual(base.length, 42, '基础目录应为 42 项，实际: ' + base.length);
+  assert.strictEqual(cmds.length, 24, '默认显示应为 24 项，实际: ' + cmds.length);
+  // 上标/下标已恢复进面板，但默认隐藏（用户在快捷插入排序里按需开启）
+  assert.ok(base.some((c) => c.action === 'insert-superscript'), '上标应已恢复进目录');
+  assert.ok(!cmds.some((c) => c.action === 'insert-superscript'), '上标应默认隐藏');
+  assert.ok(base.some((c) => c.action === 'insert-subscript'), '下标应已恢复进目录');
+  assert.ok(!cmds.some((c) => c.action === 'insert-subscript'), '下标应默认隐藏');
+  // 抽查新增项：在目录内、默认不显示
+  for (const id of ['insert-dl', 'insert-details', 'insert-footnote', 'insert-progress']) {
+    assert.ok(base.some((c) => c.action === id), '目录应含新增项 ' + id);
+    assert.ok(!cmds.some((c) => c.action === id), '新增项 ' + id + ' 应默认隐藏');
+  }
   // 高频块级语法置顶：标题1/2/3 → 无序/有序/任务列表
   const front = cmds.slice(0, 6).map((c) => c.action).join(',');
   assert.strictEqual(front, 'insert-h1,insert-h2,insert-h3,insert-ul,insert-ol,insert-task',
     '前 6 项应为高频标题与列表，实际: ' + front);
-  // 深层标题沉底
+  // 深层标题沉底（可见项末尾仍为 H4/H5/H6，新增项在其后且默认隐藏）
   const tail = cmds.slice(-3).map((c) => c.action).join(',');
-  assert.strictEqual(tail, 'insert-h4,insert-h5,insert-h6', '末尾应为 H4/H5/H6，实际: ' + tail);
+  assert.strictEqual(tail, 'insert-h4,insert-h5,insert-h6', '可见项末尾应为 H4/H5/H6，实际: ' + tail);
 }));
 
 test('slash: 方向键导航（含循环）', async () => withEditor({ captureInitErr: true }, async (w, ed) => {
@@ -177,4 +187,47 @@ test('slash: 真实路径继续输入字母实时过滤', async () => withEditor
   assert.strictEqual(ed._slashQuery, 'tab', '继续输入应实时更新 query');
   assert.strictEqual(ed._slashFiltered.length, 1, 'tab 应只匹配 表格(insert-table)');
   assert.strictEqual(ed._slashFiltered[0].action, 'insert-table');
+}));
+
+test('slash: 面板防溢出——光标贴近屏幕底部时翻转到光标上方（2026-10-13「最下面输入被挡住」）', async () => withEditor({ captureInitErr: true }, async (w, ed) => {
+  ed.cm.setValue('');
+  typeSlash(ed, 0, 0);
+  const panel = w.document.getElementById('slash-panel');
+  assert.ok(panel, '面板应存在');
+  // jsdom 无布局：stub 光标坐标 + 面板尺寸（真实浏览器里是实测值）
+  const VH = w.innerHeight || 768;
+  const VW = w.innerWidth || 1024;
+  const PH = 300, PW = 220;
+  Object.defineProperty(panel, 'offsetHeight', { configurable: true, value: PH });
+  Object.defineProperty(panel, 'offsetWidth', { configurable: true, value: PW });
+  const origCoords = ed.cm.cursorCoords;
+  const setCoords = (c) => { ed.cm.cursorCoords = () => c; };
+  try {
+    // ① 光标贴近底部（下方只剩 10px，放不下 300px 面板）→ 翻转到光标上方
+    const bottomCoords = { left: 50, top: VH - 40, right: 50, bottom: VH - 10 };
+    ed._closeSlashPanel();
+    ed.cm.setValue('');
+    setCoords(bottomCoords);
+    typeSlash(ed, 0, 0);
+    assert.strictEqual(ed._slashOpen, true, '应触发面板');
+    const topUp = parseFloat(panel.style.top);
+    assert.strictEqual(topUp, bottomCoords.top - 4 - PH, '下方放不下应翻转到光标上方');
+    assert.ok(topUp + PH <= VH - 8, '翻转后面板必须完整落在视口内');
+    // ② 光标在屏幕中部（下方放得下）→ 保持下方定位（不回归）
+    const midCoords = { left: 50, top: 100, right: 50, bottom: 130 };
+    ed._closeSlashPanel();
+    ed.cm.setValue('');
+    setCoords(midCoords);
+    typeSlash(ed, 0, 0);
+    assert.strictEqual(parseFloat(panel.style.top), midCoords.bottom + 4, '下方放得下时保持光标下方');
+    // ③ 光标贴近右缘 → 左移面板防右溢出
+    const rightCoords = { left: VW - 10, top: 100, right: VW - 10, bottom: 130 };
+    ed._closeSlashPanel();
+    ed.cm.setValue('');
+    setCoords(rightCoords);
+    typeSlash(ed, 0, 0);
+    assert.ok(parseFloat(panel.style.left) + PW <= VW - 8, '贴近右缘应左移，面板不得超出屏幕右缘');
+  } finally {
+    ed.cm.cursorCoords = origCoords;
+  }
 }));

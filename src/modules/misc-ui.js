@@ -58,17 +58,28 @@
   
           const link = e.target.closest('a');
           if (!link) return;
-  
+
           e.preventDefault();
           e.stopPropagation();
-  
+
+          this.handlePreviewLinkClick(link);
+        }, true);
+      },
+      // 预览链接统一分派（阅读模式与所见即所得遮罩共用）：
+      //   #锚点 → 滚动到目标并闪显；http(s) → 系统浏览器；.md → 打开标签页；mailto/tel → location。
+      // 所见即所得下 #锚点 改滚编辑器（目标标题在遮罩节点里，按块偏移还原绝对行号）。
+      async handlePreviewLinkClick(link) {
           const href = link.getAttribute('href');
           if (!href) return;
-  
+
           if (href.startsWith('#')) {
             // href 经 rehype-stringify 后非 ASCII 会被 URL 编码（如 #数学公式 → #%E6%95%B0...），
             // 需 decode 才能匹配 heading 的字面 id（id="数学公式"）。
             const id = decodeURIComponent(href.substring(1));
+            if (this.viewMode === 'wysiwyg') {
+              this._wysiwygScrollToAnchor(id);
+              return;
+            }
             const target = this.preview.querySelector(`#${CSS.escape(id)}`);
             if (target) {
               const previewHeight = this.preview.clientHeight;
@@ -202,7 +213,6 @@
           } catch (err) {
             window.open(href, '_blank', 'noopener,noreferrer');
           }
-        }, true);
       },
       showImageLightbox(src) {
         this.showLightbox(src, 'image');
@@ -413,9 +423,11 @@
           doc: document,
         });
       },
-      showConfirmDialog(title, message, action = null, warning = null) {
+      // warningTone：'danger'（默认红）| 'soft'（琥珀柔和，DOCX 同款排版，导出 PDF 能力检测通过时用）
+      // confirmLabel：确认键自定义文案（如导出场景「导出」，默认保持「确认」）
+      showConfirmDialog(title, message, action = null, warning = null, warningTone = 'danger', confirmLabel = null) {
         return Dialogs.showConfirmDialog({
-          title, message, action, warning,
+          title, message, action, warning, warningTone, confirmLabel,
           t: (k, p) => this.t(k, p),
           showToast: (msg, type) => this.showToast(msg, type),
           doc: document,
@@ -731,6 +743,7 @@
       });
       document.getElementById('update-action').addEventListener('click', () => this.handleUpdateAction());
       document.getElementById('update-skip').addEventListener('click', () => this.hideUpdateDialog());
+      document.getElementById('update-skip-version').addEventListener('click', () => this.skipUpdateVersion());
       document.getElementById('gitee-badge').addEventListener('click', () => {
         const url = document.getElementById('gitee-badge').dataset.url;
         if (url) this.openExternal(url);

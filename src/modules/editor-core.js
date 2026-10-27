@@ -158,7 +158,13 @@
         const LIST_LINE_RE = /^(\s*)(?:>[> ]*|[*+-]\s\[[xX ]\]\s|[*+-]\s|\d+[.)]\s)/;
         this.cm = CodeMirror(document.getElementById('editor-wrapper'), {
           value: '',
-          mode: 'gfm',
+          // gitHubSpice 关闭（2026-10-15 用户截图：列表项 "5454554" 编辑态带下划线、
+          // 渲染态没有）：gfm 模式默认开启 GitHub 高亮，7–40 位十六进制串（SHA）/ #数字
+          // （issue）被 tokenize 成 link → cm-link → codemirror.css .cm-link 的
+          // text-decoration:underline 在编辑态漏出；而渲染器（remark）根本不把这些
+          // 识别成链接 → 编辑/渲染不一致。普通 URL 的 cm-link（urlRE 分支）不受影响，
+          // 渲染态本来就有下划线，保持原样。
+          mode: { name: 'gfm', gitHubSpice: false },
           theme: 'default',
           inputStyle: 'contenteditable',
           lineNumbers: true,
@@ -321,7 +327,7 @@
           this.showZoomHint('preview');
         }, true);  // capture：先于预览内部可能的滚动监听拦截
   
-        this.cm.on('change', () => {
+        this.cm.on('change', (cmObj, c) => {
           this.activeTab.content = this.cm.getValue();
           this.updateTabDisplay();
           // 大文档滑动窗口模式：打字时把窗口焦点同步到光标当前行（0-based），
@@ -331,6 +337,15 @@
             this._previewFocusLine = this.cm.getCursor().line;
           }
           this.debounceUpdatePreview();
+          // 空行占位提示：输入后当前行可能不再为空、或空行新起一行，需重算
+          this.updateEmptyLineHint();
+          // 所见即所得：仅更新块行索引缓存。
+          // ⚠️ 绝不可在 change 里调 renderWysiwygMasks()——那样每次按键都要
+          //    clear 全部标记 + 对所有块跑一遍 Markdown 渲染 + cm.refresh()，
+          //    实测造成严重卡顿与抖动（2026-10-06 真机反馈）。昂贵渲染走 250ms 防抖补齐。
+          // 传变更对象（S90 问题 3）：防抖回调据此判定「行内非结构编辑」跳过整篇 remark
+          // 重解析（5000 行约 1s，中文 IME 停顿即触发——输入延迟主因）。
+          if (this.viewMode === 'wysiwyg') this.refreshWysiwygBlocks(c);
         });
   
         this.cm.on('renderLine', (cm, line, el) => {
@@ -340,6 +355,89 @@
             el.classList.remove('cm-base64-line');
           }
         });
+
+        // IME 防吞字（阶段3 计划项）：中文输入法组合期间，任何 cm.refresh() / 遮罩重排
+        // 都可能打断 composition 导致吞字。组合期间仅记录状态，compositionend 后再补刷新。
+        this._wysiwygComposing = false;
+        this.cm.on('compositionstart', () => { this._wysiwygComposing = true; });
+        this.cm.on('compositionend', () => {
+          this._wysiwygComposing = false;
+          if (this.viewMode === 'wysiwyg') this.refreshWysiwygBlocks();
+        });
+        // ⚠️ CM 5.65.18 不触发用户级 compositionstart/end 编辑器事件（上面两个 cm.on
+        //    处理器实际不执行，官方源码与 vendor 版一致，2026-10-14 核过 npm 5.65.18）。
+        //    幽灵键时间戳必须挂在输入域的浏览器原生 DOM 事件上：WebView2/Chromium
+        //    中文 IME 的 Enter 存在两条幽灵通道（均造成「列表回车后光标落新行的下一行」）：
+        //    a) keydown 通道——compositionend 后残留 isComposing=false 的 keydown
+        //       （format.js _handleTableEnter 窗①/窗②吞除）；
+        //    b) input 通道（2026-10-15 用户复现）——真实 Enter 已被 extraKeys 消费后，
+        //       输入域仍收到原生 insertLineBreak/insertParagraph（beforeinput）→ CM5
+        //       ContentEditableInput 只在 'input' 事件读 DOM 差分（codemirror.js L8876，
+        //       完全不监听 beforeinput）→ 一条裸换行（不走列表续行逻辑）进模型 →
+        //       列表下多一条空行、光标落在「新行的下一行」（空 bullet 行仍在）。
+        //       合法 keydown Enter 被 extraKeys preventDefault 后浏览器不再为其投递
+        //       beforeinput → 紧随 _lastEnterKeydownAt（format.js 记录）到达的
+        //       insertLineBreak 必是幽灵 → 取消（beforeinput 被取消则对应 input 事件
+        //       不再触发，CM 读不到幽灵换行）。
+        try {
+          const inputField = this.cm.getInputField();
+          // ⚠️ 组合标志必须挂输入域**原生 DOM** 事件（上方 cm.on('compositionstart/end')
+          //    是死代码：CM 5.65.18 不触发用户级 composition 编辑器事件，2026-10-14 核过
+          //    npm 5.65.18 与 vendor 源码一致）。组合标志一死，wysiwyg.js 三处
+          //    if(_wysiwygComposing) 守卫（L2540 活动行装饰、L2889 重排顺延、L3155）全部失效，
+          //    本处 beforeinput 守卫也认不出「正在组合中」。
+          // 组合期（compositionstart→compositionend）内的 insertLineBreak/insertParagraph 必是幽灵
+          // （用户在敲拼音、没按 Enter）→ 一律吞。compositionend 必随 blur 到达（实测标志不残留）。
+          // 2026-10-18 真机复核：组合标志修复的是「幽灵换行进模型」（S50 场景），
+          // 与用户报的「拼音竖排」**无关**——竖排是 CSS 层（24px 前缀槽折行，
+          // 见 styles.css .wysiwyg-ol-marker / .wysiwyg-task-prefix），组合期模型恒干净。
+          // 2026-10-18 真机实测确认本处有效：组合期原生 beforeinput(insertLineBreak) 在
+          // HEAD 版不被取消（defaultPrevented=false），挂原生 compositionstart 后恒被取消。
+          inputField.addEventListener('compositionstart', () => {
+            this._wysiwygComposing = true;
+            // 防御：format.js 万一未加载，也不得让组合监听器抛错（组合标志必须优先立起）
+            if (this._recordBareListMarkerForIme) this._recordBareListMarkerForIme();
+            // 标题行组合期字号保持（2026-10-19 用户反馈 #2：组合文本在装饰 span 外按基准
+            // 字号渲染 → 输入标题时字号闪），wysiwyg.js 挂类，未加载时跳过
+            if (this._wysiwygImeCompositionStart) this._wysiwygImeCompositionStart();
+          });
+          inputField.addEventListener('compositionend', () => {
+            this._wysiwygComposing = false;
+            this._lastCompositionEnd = Date.now();
+            if (this._repairImeDamagedListPrefix) this._repairImeDamagedListPrefix();
+            // 组合确认立即读 DOM 进模型（CM5 readFromDOMSoon 的 80ms 定时器之前先一步）：
+            // 空窗期标题行装饰 span 缺失 → 基准字号闪烁（2026-10-19 用户反馈 #2）
+            if (this._wysiwygImeCompositionEnd) this._wysiwygImeCompositionEnd();
+            if (this._wysiwygImeFlushDOM) this._wysiwygImeFlushDOM();
+          });
+          inputField.addEventListener('beforeinput', (e) => {
+            if (e.inputType !== 'insertLineBreak' && e.inputType !== 'insertParagraph') return;
+            // ① 组合期幽灵（S50 场景）：组合期逐字产生幽灵 insertLineBreak（input 通道），
+            //    双时间戳窗口罩不住「正在组合中」（两戳都是几秒前旧值 >2000ms）→ 组合标志
+            //    识别，一律吞（上屏由 IME 完成，组合期内的换行必是幽灵）。
+            if (this._wysiwygComposing) {
+              e.preventDefault();
+              console.debug('[tizumark] 吞除组合期幽灵换行（input 通道，compositionstart 内）');
+              return;
+            }
+            // ② 组合外幽灵——窗口 2000ms（2026-10-16 原 300ms 实测漏检 WebView2 IPC 延迟）：
+            //    双时间戳识别 a) _lastEnterKeydownAt：合法 Enter keydown 恒被 extraKeys
+            //    消费，其后 insertLineBreak 必是幽灵；b) _lastCompositionEnd：IME 确认
+            //    Enter 被输入法完整消费（无残留 keydown 进 extraKeys、_lastEnterKeydownAt
+            //    不刷新）时幽灵仍会到达，此时只有 compositionend 时间戳能识别。
+            //    安全性：合法键盘 Enter 恒被 extraKeys 消费（preventDefault 后不产生
+            //    beforeinput）；粘贴 inputType 为 insertFromPaste/insertText 不同 → 窗口内
+            //    的 insertLineBreak/insertParagraph 必为幽灵，一律吞。
+            const nowTs = Date.now();
+            const sinceEnter = this._lastEnterKeydownAt ? nowTs - this._lastEnterKeydownAt : Infinity;
+            const sinceCompEnd = this._lastCompositionEnd ? nowTs - this._lastCompositionEnd : Infinity;
+            if (sinceEnter < 2000 || sinceCompEnd < 2000) {
+              e.preventDefault();
+              console.debug('[tizumark] 吞除幽灵换行（input 通道，Enter keydown 后 '
+                + sinceEnter + 'ms / compositionend 后 ' + sinceCompEnd + 'ms）');
+            }
+          });
+        } catch (_) { /* 编辑器已销毁等，忽略 */ }
   
         this.cm.on('cursorActivity', () => {
           const cursor = this.cm.getCursor();
@@ -357,6 +455,10 @@
           this.updateBreadcrumb();
           // 光标移动时大纲同步高亮当前标题（与面包屑一致）
           this.updateOutlineActive(cursor.line);
+          // 光标进出空行时增删占位提示（源码 + 所见即所得两模式均生效）
+          this.updateEmptyLineHint();
+          // 所见即所得：跨块时重建块遮罩（当前块显源码、上一块恢复渲染），含块高抖动补偿
+          this.syncWysiwygActiveBlock();
         });
   
         // 双标志锁机制（demo 风格：canScroll.editor / canScroll.showDom）

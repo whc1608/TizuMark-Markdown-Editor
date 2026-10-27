@@ -214,14 +214,18 @@
           </div>
         </div>
         <div class="toolbar-center" data-tauri-drag-region>
-          <div class="view-mode-tabs">
-            <button id="btn-view-preview" class="view-mode-tab active" title="预览模式">
+          <div class="view-mode-tabs" id="view-mode-tabs">
+            <button id="btn-view-preview" class="view-mode-tab active" data-mode="preview" data-tip-key="viewModeReadTip">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
-              <span>预览</span>
+              <span>阅读</span>
             </button>
-            <button id="btn-view-edit" class="view-mode-tab" title="编辑模式">
+            <button id="btn-view-edit" class="view-mode-tab" data-mode="edit" data-tip-key="viewModeSourceTip">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
-              <span>编辑</span>
+              <span>源码</span>
+            </button>
+            <button id="btn-view-wysiwyg" class="view-mode-tab" data-mode="wysiwyg" data-tip-key="viewModeWysiwygTip">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+              <span>实时预览（beta）</span>
             </button>
           </div>
         </div>
@@ -732,6 +736,10 @@
             <span id="update-progress-text">0%</span>
           </div>
         </div>
+        <div id="update-state-downloaded" class="hidden">
+          <p>TizuMark <span id="update-dl-version" class="update-version-highlight"></span> <span id="update-dl-suffix">安装包已下载</span></p>
+          <p class="update-current" id="update-dl-info"></p>
+        </div>
         <div id="update-state-latest" class="hidden">
           <div class="update-latest-card">
             <div class="update-latest-icon">
@@ -747,6 +755,7 @@
       </div>
       <div class="dialog-footer">
         <button class="dialog-btn" id="update-skip">稍后再说</button>
+        <button class="dialog-btn" id="update-skip-version">跳过此版本</button>
         <button class="dialog-btn dialog-btn-primary" id="update-action" data-state="" disabled>正在检查...</button>
       </div>
       <div class="dialog-resize-handle" aria-hidden="true"></div>
@@ -792,13 +801,14 @@
     <div class="dialog confirm-dialog">
       <div class="dialog-header">
         <h2 id="confirm-dialog-title">确认</h2>
+        <button class="dialog-close" id="confirm-dialog-close" aria-label="关闭">&times;</button>
       </div>
       <div class="dialog-content">
+        <p id="confirm-dialog-message" style="white-space: pre-line;">确定要恢复默认设置吗？</p>
         <div id="confirm-dialog-warning" class="dialog-warning hidden">
           <span class="dialog-warning-icon" aria-hidden="true">⚠</span>
           <span id="confirm-dialog-warning-text"></span>
         </div>
-        <p id="confirm-dialog-message" style="white-space: pre-line;">确定要恢复默认设置吗？</p>
       </div>
       <div class="dialog-footer">
         <button id="confirm-dialog-cancel" class="dialog-btn">取消</button>
@@ -1425,6 +1435,7 @@
 <script src="modules/file-search.js"></script>
 <script src="modules/dialog-drag-resize.js"></script>
 <script src="modules/image-processor.js"></script>
+<script src="modules/render-post.js"></script>
 <script src="modules/font-picker.js"></script>
 <script src="modules/select.js"></script>
 <script src="modules/export-docx.js"></script>
@@ -1448,6 +1459,8 @@
 <script src="modules/format.js"></script>
 <script src="modules/context-menu.js"></script>
 <script src="modules/slash.js"></script>
+<script src="modules/empty-hint.js"></script>
+<script src="modules/wysiwyg.js"></script>
 <script src="modules/lifecycle.js"></script>
 <script src="modules/toolbar.js"></script>
 <script src="controllers/preview-controller.js"></script>

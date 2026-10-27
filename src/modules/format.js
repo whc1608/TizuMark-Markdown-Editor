@@ -4,6 +4,14 @@
 (function () {
   'use strict';
 
+  // —— IME 上屏污染列表前缀的识别（见 _repairImeDamagedListPrefix）——
+  // 纯列表标记行：可带缩进与尾空格，标记后没有正文（空列表项）。
+  const IME_BARE_LIST_RE = /^(\s*)(?:\d{1,9}[.)]|[-*+])(\s*)$/;
+  // 被污染形态：标记与正文之间丢掉了必需的源空格（如 "1.中国 "）。markdown 列表要求标记后
+  // 必须有空白，故这种行不再是合法列表项；正文以 \S 开头保证只匹配「真的少了空格」的行。
+  // 尾随的 \s* 捕获的就是被挤到行尾的那个源空格——复原时丢掉它、把分隔空格补回标记之后。
+  const IME_DAMAGED_LIST_RE = /^(\s*)((?:\d{1,9}[.)]|[-*+]))(\S.*?)(\s*)$/;
+
   const mixin = {
       wrapSelection(before, after) {
         const sel = this.cm.getSelection();
@@ -143,6 +151,19 @@
         // 无选区：原单行行为（含上一行非空时自动换行再加前缀）
         const cursor = cm.getCursor();
         const line = cm.getLine(cursor.line);
+        // 2026-10-25 用户反馈（嵌套引用块）：光标行已是引用行（含回车产生的 `> ` 续行）时，
+        // 「插入引用」= 在当前引用块内原位嵌套——行首加一级 `> `（与选区分支「linePrefix + text」
+        // 同一语义：> a → > > a），不走「上一行非空 → 插无前缀空行」路径——那条路径会把引用块
+        // 拆成两块（空行分隔），新块成为外层+1 级的独立嵌套盒（用户截图：引用内 / 插入引用块
+        // 出一排独立盒，末次插入成空盒）。引用行口径收口 constants.js 共享常量（与 wysiwyg.js
+        // RE.quote 同源）；此处用 window.TMConst 因本方法体被 list-insert.test.cjs 抽取 eval
+        // 执行（stub 上下文裸标识符无 TMConst）。
+        if (prefix === '> ' && window.TMConst.BLOCKQUOTE_LINE_RE.test(line)) {
+          cm.replaceRange(prefix, { line: cursor.line, ch: 0 }, { line: cursor.line, ch: 0 });
+          cm.setCursor({ line: cursor.line, ch: cursor.ch + prefix.length });
+          cm.focus();
+          return;
+        }
         const prevLine = cursor.line > 0 ? cm.getLine(cursor.line - 1) : '';
         const needNewline = cursor.line > 0 && prevLine.trim() !== '';
         const newLine = needNewline ? '\n' : '';
@@ -205,12 +226,99 @@
         // 无标题标记 → 沿用原有插入行为（含上一行非空时自动换行）
         this.insertLinePrefix(prefix);
       },
+      // —— IME 组合串落在列表前缀槽上、把前缀写坏的修复 ——
+      // 用户反馈（2026-10-19）：「有序列表按回车没有新增一行，比如第一行是序号 1，行尾按回车，
+      // 应该新增一行、序号是 2，但现在是直接跳出有序列表了」。
+      // 成因（真机 CDP 复现，用 Input.insertText 模拟输入法上屏）：空列表项（"1. " / "- " /
+      // "- [ ] "）是列表行里唯一「正文没有文本节点」的行——前缀槽固定 24px、源空格槽零宽
+      // （styles.css 的 .wysiwyg-ol-marker / .wysiwyg-ol-space），Chromium 找不到能承载组合串的
+      // 正文文本节点，就把拼音组合串塞进前缀槽**自己的文本节点**（组合期实测 DOM：
+      // <span class="wysiwyg-ol-marker">1.zhongguo</span>）。上屏时 CM 读 DOM 差分，
+      // 源里 marker 与正文之间那个分隔空格被挤到行尾 → 模型变成 "1.中国 "，不再是合法列表项
+      // （continuelist 的 listRE 要求标记后必须有 \s）→ Enter 落到普通 newlineAndIndent 分支
+      // = 退出列表，而不是续出 "2. "。只有空的有序列表项会中招：空无序项 "- "、空任务项
+      // "- [ ] "、以及有正文的行（组合串落在正文 span）都正常。
+      // 修法：组合开始前记下「这行是否只有列表标记」，上屏后若这行变成「标记直接贴上内容」，
+      // 把丢掉的空格补回标记之后、并同步右移光标，使其重新成为合法列表项。
+      _recordBareListMarkerForIme() {
+        this._imeBareMarker = null;
+        const cm = this.cm;
+        if (!cm) return;
+        const pos = cm.getCursor();
+        const text = cm.getLine(pos.line);
+        // 只有「纯列表标记（可带缩进/尾空格）」才需要修——有正文的行组合串落在正文 span，天然安全
+        if (!IME_BARE_LIST_RE.test(text)) return;
+        this._imeBareMarker = { line: pos.line };
+      },
+      // 组合结束后修复被 IME 写坏的列表前缀（配合 _recordBareListMarkerForIme）。
+      // 只修「组合前是纯标记空项、且上屏后标记直接贴上非空格字符」的行，其余一律不动。
+      _repairImeDamagedListPrefix() {
+        const cm = this.cm;
+        const keep = this._imeBareMarker;
+        this._imeBareMarker = null;
+        if (!cm || !keep) return;
+        // CM 读 DOM 是防抖的（codemirror.js readFromDOMSoon 80ms 后才 updateFromDOM），
+        // compositionend 当下模型里可能还是旧文本 → 轮询到模型更新为止（上限 ~800ms，够用且不失控）。
+        let tries = 0;
+        const apply = () => {
+          tries++;
+          if (keep.line < cm.lineCount()) {
+            const line = cm.getLine(keep.line);
+            const m = IME_DAMAGED_LIST_RE.exec(line);
+            if (m) {
+              const indent = m[1], marker = m[2], body = m[3];
+              // 行尾的尾随空白（m[4]）就是被挤到行尾的那个源空格：复原时直接丢掉，
+              // 只把标记后的分隔空格补回去，还原成 "1. 中国"（而不是 "1. 中国 "）。
+              const fixed = indent + marker + ' ' + body;
+              const pos = cm.getCursor();
+              const pivot = indent.length + marker.length;   // 标记右缘：光标在此之后才需要右移
+              cm.operation(() => {
+                cm.replaceRange(fixed, { line: keep.line, ch: 0 }, { line: keep.line, ch: line.length });
+                if (pos.line === keep.line && pos.ch > pivot) cm.setCursor({ line: keep.line, ch: pos.ch + 1 });
+              });
+              return;
+            }
+          }
+          if (tries < 10) setTimeout(apply, 80);
+        };
+        setTimeout(apply, 80);
+      },
       // 表格行内按 Enter 自动补充表格结构
       // 表格行内 Enter：整理整段表格（对齐/补齐分隔行/统一列数）并在当前行下方插入等列空白行。
       // 整理规则（用户反馈）：① 缺分隔行→自动补齐；② 分隔行数量不足→补全；
       // ③ 分隔行不规范（如 |--|）→规范为 | --- |；④ 各行列数不统一→缺失行补空白格；
       // ⑤ 单元格不规范（如 |内容 |）→规范为 | 内容 |。
       _handleTableEnter(cm) {
+        // 先记录本笔 keydown Enter（即使下面被吞掉也记录）：输入域级幽灵换行守卫
+        //（editor-core beforeinput）用这个时间戳识别「同一次按键的重复投递」——合法
+        // keydown Enter 已被 extraKeys preventDefault，浏览器不会再为它投递 beforeinput，
+        // 故紧随其后的 insertLineBreak 一律是幽灵。
+        const now = Date.now();
+        const sincePrevEnter = this._lastEnterKeydownAt ? now - this._lastEnterKeydownAt : Infinity;
+        this._lastEnterKeydownAt = now;
+        // WebView2/Chromium 中文 IME 时序怪癖：compositionend 可能先于「选字确认的
+        // Enter」keydown 到达（此刻 isComposing=false）——该 Enter 是 IME 确认键的残影，
+        // 不是用户想换行。若当真处理：列表行会多出一条续行，用户真正的 Enter 又再续一行
+        // → 用户看到「光标在新起那行的下一行」（2026-10-14 用户反馈「列表按回车新起一行
+        // 没问题，但光标回到新行的下一行」的根因）。与表格格编辑同一规则（wysiwyg.js
+        // L1215-1224）：组合刚结束 250ms 内的 Enter 一律吞掉；用户真正的换行 Enter 在
+        // 更晚按下，正常生效。extraKeys 处理器返回 undefined = 键被消费（codemirror.js
+        // doHandleBinding：bound(cm) != Pass → preventDefault），不产生换行。
+        if (this._lastCompositionEnd && now - this._lastCompositionEnd < 250) return;
+        // 窗②（2026-10-15 用户复现）：用户选字提交后又继续输入（距 compositionend 已超
+        // 250ms、窗①失效）再按 Enter——WebView2 的幽灵可能是「本笔 Enter 按键的重复
+        // 投递」，紧随真实 Enter keydown 数十 ms 之后到达。若放行：真实 Enter 已续出列表
+        // 行，幽灵又续/插一行 → 光标落在「新行的下一行」（截图：空 bullet 行 + 其下空行，
+        // 光标在空行）。人为连按两次 Enter 间隔 ≥80ms，且此处还要求「组合 10s 内刚结束」
+        // 双条件，避免误吞无 IME 上下文的快速输入。
+        if (sincePrevEnter < 150 && this._lastCompositionEnd && now - this._lastCompositionEnd < 10000) return;
+        // 所见即所得 HTML 容器块（折叠区块等）：光标在块末结构行（</details> 闭标签行）
+        // 按 Enter → 新行插在结构行前（块内灰盒内），不出块、不跳出编辑态（2026-10-22
+        // 用户反馈「从末尾点击回车会跳出折叠列表编辑态，在折叠列表下方新增一行」）。
+        // 围栏块（代码 / 图表）闭围栏行不拦截（2026-10-25 用户要求：``` 是普通可编辑内容，
+        // 行尾回车新行落 ``` 下方、退出代码块，同 Typora 口径）。源码模式不受影响。
+        if (this.viewMode === 'wysiwyg' && this._wysiwygEnterOnBlockCloseLine &&
+            this._wysiwygEnterOnBlockCloseLine(cm)) return;
         const TABLE_ROW_RE = /^\|.*\|\s*$/;
         const TABLE_SEPARATOR_RE = /^\|\s*[-:][-:\s]*\|/;
         const pos = cm.getCursor();
@@ -413,7 +521,11 @@
         const needNewline = line.trim() !== '';
         const prefix = needNewline ? '\n\n' : '';
         const addedLines = needNewline ? 2 : 0;
-        this.cm.replaceRange(prefix + text + '\n', cursor);
+        // 尾随换行只在该插入点之后还有内容时才补：光标在文末行末补换行会多留一条空源码行，
+        // 该空行在 WYSIWYG 下坍缩成 12px 空白并被活动块底色刷成灰条（用户报「多出来一行灰色空白行」）。
+        const hasTail = cursor.ch < line.length || cursor.line < this.cm.lastLine();
+        const suffix = hasTail ? '\n' : '';
+        this.cm.replaceRange(prefix + text + suffix, cursor);
         if (cursorOffset !== undefined) {
           const before = text.substring(0, cursorOffset);
           const lastNewline = before.lastIndexOf('\n');
@@ -426,31 +538,29 @@
         }
         this.cm.focus();
       },
-      // 在光标所在行下方插入空行（不截断当前行），光标保持在原来位置（原行、原列），不移动到新行。
+      // 在光标所在行下方插入空行（不截断当前行），光标跳转到新加的空行（行首）。
       insertLineBelow() {
         const cm = this.cm;
         if (!cm) return;
-        const cur = cm.getCursor();
-        const lineNo = cur.line;
+        const lineNo = cm.getCursor().line;
         const lineLen = cm.getLine(lineNo).length;
         cm.operation(() => {
           // 在行尾追加换行 → 当前行光标后文本留在原行，不截断；下方生成一个新的空行。
           cm.replaceRange('\n', { line: lineNo, ch: lineLen });
-          // 光标保持在原行、原列位置（新空行在其下方，原行内容不受影响）。
-          cm.setCursor({ line: lineNo, ch: cur.ch });
+          // 光标跳转到新加的空行（原行下方，列 0）。
+          cm.setCursor({ line: lineNo + 1, ch: 0 });
         });
       },
-      // 在光标所在行上方插入空行：原行整体下移，光标跟随原文本行、保持原列位置（不移动到新行）。
+      // 在光标所在行上方插入空行：原行整体下移，光标跳转到新加的空行（行首）。
       insertLineAbove() {
         const cm = this.cm;
         if (!cm) return;
-        const cur = cm.getCursor();
-        const lineNo = cur.line;
+        const lineNo = cm.getCursor().line;
         cm.operation(() => {
           // 在当前行行首插入换行 → 原行整体下移，上方生成一个新的空行。
           cm.replaceRange('\n', { line: lineNo, ch: 0 });
-          // 原文本整体下移一行，光标跟随到原文本所在的新行（lineNo+1），保持原列位置。
-          cm.setCursor({ line: lineNo + 1, ch: cur.ch });
+          // 新加的空行即原 lineNo（原文本已下移到 lineNo+1），光标跳转到新行行首。
+          cm.setCursor({ line: lineNo, ch: 0 });
         });
       },
   };

@@ -31,7 +31,10 @@
           extendedSyntax: true,
           showTrayIcon: true,
           closeAction: 'ask',
-          clearTabsOnQuit: false, // 退出应用时不保存标签会话，下次打开总是空白
+          // 更新提示「跳过此版本」：记住被跳过的远程版本号（精确匹配），
+         // 自动检查遇到同版本不再弹窗；更高版本不受影响。空串=未跳过。
+         skippedUpdateVersion: '',
+         clearTabsOnQuit: false, // 退出应用时不保存标签会话，下次打开总是空白
           showAllFiles: false, // 文件树过滤：默认只列受支持格式（markdown/image/text），true 时显示目录内全部文件
           toolbarCollapsed: false,
           sidebarHidden: false,
@@ -351,6 +354,7 @@
             ariaLabelKey: 'colorScheme',
             optionsProvider: (t) => ([
               { value: 'default', label: t('schemeDefault') },
+              { value: 'classic', label: t('schemeClassic') },
               { value: 'sunset', label: t('schemeSunset') },
               { value: 'forest', label: t('schemeForest') },
               { value: 'nord', label: t('schemeNord') },
@@ -439,8 +443,9 @@
             t: this.t.bind(this),
             ariaLabelKey: 'defaultView',
             optionsProvider: (t) => ([
-              { value: 'preview', label: t('preview') },
-              { value: 'edit', label: t('edit') },
+              { value: 'preview', label: t('viewModeRead') },
+              { value: 'edit', label: t('viewModeSource') },
+              { value: 'wysiwyg', label: t('viewModeWysiwyg') },
             ]),
             onChange: (v) => { this.settings.defaultView = v; },
           });
@@ -516,7 +521,9 @@
         this.cm.setOption('tabSize', s.tabSize);
         this.cm.setOption('indentUnit', s.tabSize);
         this.cm.setOption('lineWrapping', s.lineWrap);
-        this.cm.setOption('lineNumbers', s.lineNumbers);
+        // 行号 + 最大宽度由所见即所得外壳统一同步（所见即所得下强制去行号，离开按设置恢复）
+        if (this.applyWysiwygEditorChrome) this.applyWysiwygEditorChrome();
+        else this.cm.setOption('lineNumbers', s.lineNumbers);
         this.preview.style.fontSize = s.previewFontSize + 'px';
         this.previewZoom = null; // 应用设置时回落到设置字号（与编辑器 tab.fontSize 重置一致）
         this.preview.style.lineHeight = String(s.lineHeight);

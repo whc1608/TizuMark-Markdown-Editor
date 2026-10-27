@@ -18,14 +18,28 @@
   const PREVIEW_WINDOW_LINES = 1200;  // 窗口源码行数上限
   const PREVIEW_WINDOW_LEAD = 200;    // 焦点行前预留行数（让焦点不至于贴顶）
 
+  // 块引用行口径（共享收口，2026-10-25）：行首（可带前导空白）为 `>` 的行。
+  // 消费方：wysiwyg.js RE.quote（引用块切块 / 回车续行 / 活动行判定）与
+  // format.js insertLinePrefix（光标行已是引用行时「插入引用」原位嵌套一级，
+  // 不再插无前缀空行拆块——同日用户反馈「引用块内 / 插入引用块要嵌套而非独立盒」）。
+  // 改口径只改这一处。
+  const BLOCKQUOTE_LINE_RE = /^(\s*)>/;
+
   // 快捷插入（slash）命令分类：
   //  - 字体相关操作（加粗/斜体/删除线/高亮）默认隐藏并置底；
   //  - 前置高频项（行内代码/水平线/引用块/代码块）默认排在最前；
   //  - 其余项默认显示、保持原相对顺序排在中间。
   const SLASH_FONT_ACTIONS = ['insert-bold', 'insert-italic', 'insert-strikethrough', 'insert-highlight'];
   const SLASH_FRONT_ACTIONS = ['insert-inline-code', 'insert-hr', 'insert-quote', 'insert-code-block'];
-  // 默认隐藏集合 = 字体类（开关默认关闭）；其余开关默认开启
-  const DEFAULT_SLASH_HIDDEN = SLASH_FONT_ACTIONS.slice();
+  // 2026-10-22 全量比对补齐：渲染器实际支持、旧面板遗漏的内容类型（定义列表/折叠区块/
+  // 脚注/进度条/居中块/下划线/插入内容/删除内容/图注/按键标签/缩写词/注音）+ 恢复
+  // 历史上移出的上标/下标（动作早已实现，仅面板缺失）。全部进快捷插入排序，
+  // 但开关默认关闭（默认不启用，用户在设置里按需开启）。
+  const SLASH_NEW_ACTIONS = ['insert-dl', 'insert-details', 'insert-footnote', 'insert-progress',
+    'insert-center', 'insert-u', 'insert-ins', 'insert-del', 'insert-figure', 'insert-kbd',
+    'insert-abbreviation', 'insert-ruby', 'insert-superscript', 'insert-subscript'];
+  // 默认隐藏集合 = 字体类 + 新增项（开关默认关闭）；其余开关默认开启
+  const DEFAULT_SLASH_HIDDEN = SLASH_FONT_ACTIONS.concat(SLASH_NEW_ACTIONS);
 
   // 系统字体由 Rust 命令 list_system_fonts 精确枚举（fontdb，跨平台），
   // 不内置任何字体文件（等线/微软雅黑/苹方等版权字体绝不打包分发）。
@@ -129,8 +143,10 @@
     HEAD_RENDER_CHAR_CAP,
     PREVIEW_WINDOW_LINES,
     PREVIEW_WINDOW_LEAD,
+    BLOCKQUOTE_LINE_RE,
     SLASH_FONT_ACTIONS,
     SLASH_FRONT_ACTIONS,
+    SLASH_NEW_ACTIONS,
     DEFAULT_SLASH_HIDDEN,
     SYSTEM_FONT_WHITELIST,
     SYSTEM_FONT_WHITELIST_SET,

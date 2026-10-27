@@ -854,6 +854,242 @@ fn app_data_dir(app: tauri::AppHandle) -> Result<String, String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+// ====== 更新安装包磁盘缓存 ======
+// tauri-plugin-updater 的 `plugin:updater|download` 把安装包字节放在 webview 资源表里
+// （纯内存），进程退出即丢失，下次检查更新只能重新下载。应用层在此补磁盘缓存：
+//   1. download_update_to_file：按更新 JSON 的 url 流式下载到 app_data_dir/updates/，
+//      落 .tmp → minisign 验签通过才转正 → 写 sidecar（version/signature/size）；
+//   2. find_cached_update：检查更新时按 version+signature 命中缓存（签名不一致
+//      视为官方重新上传 → 未命中，重新下载）；
+//   3. install_cached_update：读回缓存安装包，用本次 check 的 Update 元数据再验一次
+//      签名，交给插件 Update::install（与内存字节同一安装路径：临时文件 → ShellExecute）。
+// 缓存文件：installer_{version}.exe + installer_{version}.meta.json。
+
+fn updates_cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("updates");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新缓存目录失败: {e}"))?;
+    Ok(dir)
+}
+
+/// updater 公钥（tauri.conf.json 的 plugins.updater.pubkey）
+fn updater_pubkey<R: tauri::Runtime, M: tauri::Manager<R>>(mgr: &M) -> Result<String, String> {
+    mgr.config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|v| v.get("pubkey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "读不到 updater 公钥（tauri.conf.json plugins.updater.pubkey）".to_string())
+}
+
+/// minisign 验签，口径与 tauri-plugin-updater 的 verify_signature 完全一致：
+/// base64 解码 → PublicKey/Signature::decode → verify(data, sig, strict=true)
+fn verify_update_signature(data: &[u8], signature_b64: &str, pub_key_b64: &str) -> Result<(), String> {
+    use base64::Engine;
+    let eng = base64::engine::general_purpose::STANDARD;
+    let from_b64 = |b64: &str, what: &str| -> Result<String, String> {
+        let decoded = eng.decode(b64).map_err(|e| format!("{what} base64 解码失败: {e}"))?;
+        Ok(std::str::from_utf8(&decoded)
+            .map_err(|_| format!("{what} 不是合法字符串"))?
+            .to_string())
+    };
+    let pub_key = minisign_verify::PublicKey::decode(&from_b64(pub_key_b64, "公钥")?)
+        .map_err(|e| format!("公钥无效: {e}"))?;
+    let signature = minisign_verify::Signature::decode(&from_b64(signature_b64, "签名")?)
+        .map_err(|e| format!("签名无效: {e}"))?;
+    pub_key
+        .verify(data, &signature, true)
+        .map_err(|e| format!("签名校验失败（安装包签名不匹配）: {e}"))
+}
+
+/// 版本号用于文件名时的字符清洗（只留字母数字 . -，其余替换为 _）
+fn sanitize_version_for_filename(version: &str) -> String {
+    version
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect()
+}
+
+/// 下载更新安装包到本地缓存。成功返回 {path, size}；
+/// 事件形状与插件 DownloadEvent 一致：Started{contentLength}/Progress{chunkLength}/Finished。
+#[tauri::command]
+async fn download_update_to_file(
+    app: tauri::AppHandle,
+    url: String,
+    version: String,
+    signature: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    // 只允许 https（更新端点均为 https；防 file:// 等异常地址）
+    if !url.starts_with("https://") {
+        return Err("仅支持 https 下载地址".to_string());
+    }
+    if version.trim().is_empty() || signature.trim().is_empty() {
+        return Err("缺少版本号或签名".to_string());
+    }
+
+    // 连接超时 15s（QA 审查 P2）：不设整包超时（大安装包慢网下会被误杀），
+    // 但「连不上服务器」必须有界失败，否则 UI 永远停在「正在下载」且无取消按钮。
+    let response = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("下载客户端初始化失败: {e}"))?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("下载请求失败: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载失败: HTTP {}", response.status()));
+    }
+    let content_length = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let _ = on_event.send(serde_json::json!({
+        "event": "Started",
+        "data": { "contentLength": content_length },
+    }));
+
+    let dir = updates_cache_dir(&app)?;
+    let v = sanitize_version_for_filename(&version);
+    let name = format!("installer_{v}.exe");
+    let final_path = dir.join(&name);
+    let tmp_path = dir.join(format!("{name}.tmp"));
+
+    let mut file = std::fs::File::create(&tmp_path).map_err(|e| format!("创建缓存文件失败: {e}"))?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("下载中断: {e}")
+        })?;
+        if file.write_all(&chunk).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err("写入缓存文件失败".to_string());
+        }
+        let _ = on_event.send(serde_json::json!({
+            "event": "Progress",
+            "data": { "chunkLength": chunk.len() },
+        }));
+    }
+    if file.flush().is_err() || file.sync_all().is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err("写入缓存文件失败".to_string());
+    }
+    drop(file);
+    let _ = on_event.send(serde_json::json!({ "event": "Finished" }));
+
+    // 先验签，通过才转正（验签失败删掉半截文件）
+    let bytes = std::fs::read(&tmp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("读缓存安装包失败: {e}")
+    })?;
+    let size = bytes.len() as u64;
+    match verify_update_signature(&bytes, &signature, &updater_pubkey(&app)?) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    }
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("缓存文件转正失败: {e}")
+    })?;
+    let meta = serde_json::json!({
+        "version": version,
+        "signature": signature,
+        "url": url,
+        "size": size,
+        "downloadedAt": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    });
+    let _ = std::fs::write(
+        dir.join(format!("installer_{v}.meta.json")),
+        serde_json::to_string(&meta).unwrap_or_default(),
+    );
+    // 清理其他版本的旧缓存，避免磁盘堆积
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            let ours = fname == name
+                || fname == format!("{name}.tmp")
+                || fname == format!("installer_{v}.meta.json");
+            if fname.starts_with("installer_") && !ours {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    Ok(serde_json::json!({ "path": final_path.to_string_lossy().to_string(), "size": size }))
+}
+
+/// 按 version+signature 查本地缓存；命中返回 {path, size}，未命中（文件缺失 /
+/// 签名不一致 / sidecar 损坏 / 大小不符）返回 None，调用方走重新下载。
+#[tauri::command]
+fn find_cached_update(app: tauri::AppHandle, version: String, signature: String) -> Result<Option<serde_json::Value>, String> {
+    let dir = match updates_cache_dir(&app) {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    let v = sanitize_version_for_filename(&version);
+    let file = dir.join(format!("installer_{v}.exe"));
+    let meta_file = dir.join(format!("installer_{v}.meta.json"));
+    if !file.is_file() {
+        return Ok(None);
+    }
+    let meta_raw = match std::fs::read_to_string(&meta_file) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let meta: serde_json::Value = match serde_json::from_str(&meta_raw) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    if meta.get("signature").and_then(|x| x.as_str()) != Some(signature.as_str()) {
+        return Ok(None);
+    }
+    let size = file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+    if meta.get("size").and_then(|x| x.as_u64()) != Some(size) {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::json!({
+        "path": file.to_string_lossy().to_string(),
+        "size": size,
+    })))
+}
+
+/// 安装已缓存的安装包：读回文件 → 用本次 check 的 Update 元数据再验一次签名 →
+/// 调插件 Update::install（Windows 上 = 写临时文件 + ShellExecute 启动 NSIS /UPDATE）。
+#[tauri::command]
+fn install_cached_update<R: tauri::Runtime>(
+    webview: tauri::Webview<R>,
+    update_rid: u32,
+    path: String,
+) -> Result<(), String> {
+    use tauri_plugin_updater::Update;
+    let update = webview
+        .resources_table()
+        .get::<Update>(update_rid)
+        .map_err(|e| format!("获取更新元数据失败: {e}"))?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取缓存安装包失败: {e}"))?;
+    let app = webview.app_handle().clone();
+    verify_update_signature(&bytes, &update.signature, &updater_pubkey(&app)?)?;
+    update
+        .install(&bytes)
+        .map_err(|e| format!("安装失败: {e}"))
+}
+
 // ====== 系统字体枚举 ======
 // 用 fontdb 精确枚举系统全部已安装字体族名（跨平台），去重排序后返回。
 // 首次调用需解析全部字体文件头部（数百 ms），故放 spawn_blocking 避免卡 UI。
@@ -1269,10 +1505,170 @@ pub fn run() {
             rename_path,
             remove_path,
             copy_path,
-            move_path
+            move_path,
+            // 更新安装包磁盘缓存（下载落盘 / 查缓存 / 从缓存安装）
+            download_update_to_file,
+            find_cached_update,
+            install_cached_update,
+            // PDF 导出：WebView2 PrintToPdf 直接落盘（无打印对话框 / 无下载气泡）
+            print_to_pdf
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// PDF 导出落盘参数（单位：英寸 —— WebView2 PrintSettings 的约定）。
+// 用结构体传参而不是七八个散参数：命令注册表在 Windows / 非 Windows 两份实现之间
+// 必须保持同一签名，结构体最省心。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PdfPrintOptions {
+    path: String,
+    page_width: f64,
+    page_height: f64,
+    margin_top: f64,
+    margin_bottom: f64,
+    margin_left: f64,
+    margin_right: f64,
+}
+
+// PDF 导出：直接用 WebView2 的 PrintToPdf 落盘，不经过系统打印对话框、也不经过浏览器下载流程。
+//
+// 原实现（前端 iframe + contentWindow.print()）会拉起 Chromium 的打印预览，用户「另存为 PDF」
+// 时走的是浏览器下载管线 —— 窗口右上角会弹出 Edge 风格的「下载 xxx.pdf」气泡（用户反馈
+// 2026-10-25）；而且打印帧是另建的 srcdoc 文档，需要手工把 appCSS / katex / hljs 样式拼进去，
+// 拼漏一项就与阅读模式不一致（用户反馈的公式重复、代码高亮丢失都出在这条路上）。
+//
+// PrintToPdf 打印的是当前 webview 自身：前端只需把页面切到「打印态」（藏掉工具条/侧栏、
+// 展开滚动容器），样式天然就是阅读模式那一套，不存在「两套 CSS 漂移」；调用返回即表示文件
+// 已落盘，全程无 UI、无气泡、无下载目录残留。
+//
+// 失败面：旧版 WebView2 运行时没有 ICoreWebView2_7::PrintToPdf。此时返回错误，前端据此
+// 回退到原来的系统打印路径，不会让 PDF 导出整个不可用。
+#[cfg(target_os = "windows")]
+#[tauri::command]
+async fn print_to_pdf(
+    window: tauri::WebviewWindow,
+    options: PdfPrintOptions,
+) -> Result<(), String> {
+    use std::sync::mpsc::channel;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2_2, ICoreWebView2_7, ICoreWebView2Controller2, ICoreWebView2Environment6,
+        COREWEBVIEW2_COLOR,
+    };
+    use webview2_com::PrintToPdfCompletedHandler;
+    use windows::core::{Interface, PCWSTR};
+
+    let (tx, rx) = channel::<Result<(), String>>();
+    let path = options.path.clone();
+    let opts = options;
+
+    window
+        .with_webview(move |platform| {
+            let tx_cb = tx.clone();
+            let core = match unsafe { platform.controller().CoreWebView2() } {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Err(format!("拿不到 CoreWebView2: {e}")));
+                    return;
+                }
+            };
+            unsafe {
+                // 打印前把控制器默认背景临时改成纯白，打印完在回调里恢复。
+                // 根因（2026-10-27 用户实锤）：tauri.conf.json 的 backgroundColor="#f5f5f5"
+                // （防白屏闪烁）会成为 WebView2 控制器的 DefaultBackgroundColor，而
+                // PrintToPdf **用它画 PDF 的物理页边距区**（canvas 上 root 背景画不到的
+                // 部分）——前端 printStyle 把 html/body 全钉成 #fff 也管不到那里，PDF
+                // 四周永远一圈 #f5f5f5 灰。Chrome/CDP 没有 DefaultBackgroundColor 概念，
+                // 所以同样的 CSS 在 Chrome 打印验证里是纯白、真机却带灰圈。
+                // 注 1：DefaultBackgroundColor 在 ICoreWebView2Controller2（WebView2 1.0.664，
+                // 2020-09），比 PrintToPdf 所需的 ICoreWebView2_7 老得多，无版本顾虑。
+                // 注 2：必须从**控制器对象**上 QueryInterface（Controller2 派生自
+                // ICoreWebView2Controller），从 ICoreWebView2 上 cast 是一条不同的接口链，
+                // 会直接 E_NOINTERFACE（0x80004002）——2026-10-27 用户实测踩到，导出失败。
+                // 注 3：这一步只是美化（去灰圈），拿不到就跳过，绝不阻断导出。
+                // 外层已在 unsafe 块内，无需再嵌一层
+                let controller2 = platform.controller().cast::<ICoreWebView2Controller2>().ok();
+                // orig_bg 兜底值必须与 tauri.conf.json 的 backgroundColor 一致：万一某些
+                // 运行时不支持 GetDefaultBackgroundColor，恢复时不至于把 A=0 的透明色写回去。
+                let mut orig_bg = COREWEBVIEW2_COLOR { A: 255, R: 245, G: 245, B: 245 };
+                if let Some(c2) = controller2.clone() {
+                    let _ = c2.DefaultBackgroundColor(&mut orig_bg);
+                    let _ = c2.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR {
+                        A: 255, R: 255, G: 255, B: 255,
+                    });
+                }
+                let core7 = match core.cast::<ICoreWebView2_7>() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if let Some(c2) = controller2.clone() {
+                            let _ = c2.SetDefaultBackgroundColor(orig_bg);
+                        }
+                        let _ = tx.send(Err(format!("WebView2 运行时过旧（缺 PrintToPdf）: {e}")));
+                        return;
+                    }
+                };
+                // 打印设置：页面尺寸 + 四边边距 + 打印背景色 + 不要页眉页脚
+                let settings = (|| -> windows::core::Result<_> {
+                    let core2 = core.cast::<ICoreWebView2_2>()?;
+                    let env = core2.Environment()?;
+                    let env6 = env.cast::<ICoreWebView2Environment6>()?;
+                    let s = env6.CreatePrintSettings()?;
+                    s.SetPageWidth(opts.page_width)?;
+                    s.SetPageHeight(opts.page_height)?;
+                    s.SetMarginTop(opts.margin_top)?;
+                    s.SetMarginBottom(opts.margin_bottom)?;
+                    s.SetMarginLeft(opts.margin_left)?;
+                    s.SetMarginRight(opts.margin_right)?;
+                    let _ = s.SetShouldPrintBackgrounds(true);
+                    let _ = s.SetShouldPrintHeaderAndFooter(false);
+                    Ok(s)
+                })();
+                let settings = match settings {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("打印设置失败: {e}")));
+                        return;
+                    }
+                };
+                let handler = PrintToPdfCompletedHandler::create(Box::new(move |hr, ok| {
+                    // 无论成败都把控制器默认背景恢复为打印前的值（#f5f5f5 防白闪）
+                    // （闭包在外层 unsafe 块内定义，无需再嵌 unsafe）
+                    if let Some(c2) = controller2.clone() {
+                        let _ = c2.SetDefaultBackgroundColor(orig_bg);
+                    }
+                    let r = if hr.is_ok() && ok {
+                        Ok(())
+                    } else {
+                        Err(format!("PrintToPdf 失败: {hr:?}"))
+                    };
+                    let _ = tx_cb.send(r);
+                    Ok(())
+                }));
+                // 路径转 UTF-16 + NUL 结尾（PrintToPdf 收 PCWSTR）
+                let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+                if let Err(e) = core7.PrintToPdf(PCWSTR(wide.as_ptr()), &settings, &handler) {
+                    let _ = tx.send(Err(format!("PrintToPdf 调用失败: {e}")));
+                }
+            }
+        })
+        .map_err(|e| format!("with_webview 失败: {e}"))?;
+
+    // 超长文档分页渲染可能要十几秒；180s 只兜异常挂死
+    match rx.recv_timeout(std::time::Duration::from_secs(180)) {
+        Ok(r) => r,
+        Err(_) => Err("PrintToPdf 超时（180s）".to_string()),
+    }
+}
+
+// 非 Windows 平台暂无 PrintToPdf 等价能力：明确报错，让前端回退系统打印
+#[cfg(not(target_os = "windows"))]
+#[tauri::command]
+async fn print_to_pdf(
+    _window: tauri::WebviewWindow,
+    _options: PdfPrintOptions,
+) -> Result<(), String> {
+    Err("当前平台暂不支持 PrintToPdf，回退系统打印".to_string())
 }
 
 #[cfg(test)]

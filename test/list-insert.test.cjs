@@ -41,6 +41,12 @@ dom.window.Range.prototype.getClientRects = () => [];
 dom.window.Element.prototype.getBoundingClientRect = rect;
 dom.window.Element.prototype.getClientRects = () => [];
 
+// format.js insertLinePrefix 方法体在调用期引用 window.TMConst.BLOCKQUOTE_LINE_RE
+// （引用行口径共享常量，2026-10-25 嵌套引用块收口）。本环境 jsdom window 不走
+// index.html 的 script 链，需显式加载 constants.js 补全（IIFE 顶层无副作用，
+// TauriApi 仅在 dialog 函数调用期惰性引用）。
+require(path.join(ROOT, 'src', 'modules', 'constants.js'));
+
 const CodeMirror = require('codemirror');
 
 // ---- 从源码抽取真实方法（balanced-brace 扫描 + eval）----
@@ -123,6 +129,51 @@ test('A7 选区只占部分列（跨多行）：仍按整行加前缀并递增',
 });
 
 // ============================================================
+// A+ 光标行已是引用行：插入引用 = 原位嵌套（2026-10-25 用户反馈「嵌套引用块」：
+//    引用块内 / 插入引用块应在当前块内加一级 >，而非插无前缀空行拆成独立嵌套盒）
+// ============================================================
+
+test('A8 引用行 + 无选区：原位嵌套（行首加一级 >），不插空行拆块', async () => {
+  const cm = mk('> 甲\n> 乙');
+  stub.cm = cm;
+  cm.setCursor({ line: 1, ch: 3 });
+  insertLinePrefix.call(stub, '> ');
+  assert.strictEqual(cm.getValue(), '> 甲\n> > 乙');
+  // CM5 getCursor 带 sticky 字段，按字段断言
+  const c8 = cm.getCursor();
+  assert.strictEqual(c8.line, 1); assert.strictEqual(c8.ch, 5);
+});
+
+test('A9 `> ` 续行（回车产生、正文空）+ 插入引用：原位变 `> > `', async () => {
+  const cm = mk('> 甲\n> ');
+  stub.cm = cm;
+  cm.setCursor({ line: 1, ch: 2 });
+  insertLinePrefix.call(stub, '> ');
+  assert.strictEqual(cm.getValue(), '> 甲\n> > ');
+  const c9 = cm.getCursor();
+  assert.strictEqual(c9.line, 1); assert.strictEqual(c9.ch, 4);
+});
+
+test('A10 深层引用行：再加一级（> > → > > >）', async () => {
+  const cm = mk('> > 甲');
+  stub.cm = cm;
+  cm.setCursor({ line: 0, ch: 4 });
+  insertLinePrefix.call(stub, '> ');
+  assert.strictEqual(cm.getValue(), '> > > 甲');
+  const c10 = cm.getCursor();
+  assert.strictEqual(c10.line, 0); assert.strictEqual(c10.ch, 6);
+});
+
+test('A11 非引用行：保持原「上一行非空 → 换行拆块」行为（回归护栏）', async () => {
+  const cm = mk('段落。\n续行。');
+  stub.cm = cm;
+  cm.setCursor({ line: 1, ch: 0 });
+  insertLinePrefix.call(stub, '> ');
+  assert.strictEqual(cm.getValue(), '段落。\n\n> 续行。');
+  assert.deepStrictEqual(cm.getCursor(), { line: 2, ch: 2 });
+});
+
+// ============================================================
 // B. 无序列表三级预览样式（CSS：disc → circle → square → disc 循环）
 // ============================================================
 
@@ -143,13 +194,22 @@ test('B4 无序四级 ul ul ul ul：回到 disc（循环）', async () => {
 });
 
 // 回归：任务列表后未空行时，remark-gfm 会把后续普通项也放进同一个 contains-task-list，
-// 导致普通项失去 marker。CSS 需给 li:not(.task-list-item) 恢复 disc。
-test('B5 混合任务/普通列表：普通项恢复 disc marker', async () => {
+// 普通项必须恢复可见 marker。
+// 口径演进（83f826c，2026-10-16 用户反馈 #3「黑点与左侧距离异常」）：原生 outside marker
+// 相对 li 边框缘定位，任务样式把 ul padding 清零后黑点会偏左 24px → 弃用原生 marker
+// （list-style:none + padding-left:24px 拉回正文），改 ::before 绝对定位画 6px 实心圆，
+// 与正常 ul 渲染 disc 及 WYSIWYG 画圆（.wysiwyg-list-bullet）逐像素同位（S45 像素验证）。
+test('B5 混合任务/普通列表：普通项恢复 disc marker（::before 画圆口径）', async () => {
   assert.ok(CSS.includes('li:not(.task-list-item)'), 'CSS 应含 li:not(.task-list-item) 选择器');
   assert.ok(/\.preview-content\s+ul\.contains-task-list\s*>\s*li:not\(\.task-list-item\)/.test(CSS),
     '普通项选择器应针对 contains-task-list');
-  assert.ok(/li:not\(\.task-list-item\)\s*\{[^}]*list-style:\s*disc;/.test(CSS),
-    '普通项应恢复 list-style: disc');
+  // 主规则：弃原生 marker + 拉回正文缩进 + 相对定位（::before 画圆的定位上下文）
+  assert.ok(/li:not\(\.task-list-item\)\s*(?:,\s*[^{]+)?\{[^}]*list-style:\s*none;[^}]*padding-left:\s*24px;[^}]*position:\s*relative;/.test(CSS),
+    '普通项应 list-style:none + padding-left:24px + position:relative');
+  // ::before 圆点：6px 实心圆、currentColor、绝对定位
+  assert.ok(/li:not\(\.task-list-item\):?:?before\s*\{[^}]*content:\s*'';[^}]*position:\s*absolute;[^}]*width:\s*6px;[^}]*height:\s*6px;[^}]*border-radius:\s*50%;[^}]*background:\s*currentColor;/.test(CSS)
+    || /li:not\(\.task-list-item\)::before\s*\{[^}]*content:\s*'';[^}]*position:\s*absolute;[^}]*width:\s*6px;[^}]*height:\s*6px;[^}]*border-radius:\s*50%;[^}]*background:\s*currentColor;/.test(CSS),
+    '普通项 ::before 应画 6px 实心圆（与正常 ul disc 同位口径）');
 });
 
 // ============================================================

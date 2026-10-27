@@ -196,6 +196,7 @@ class MarkdownEditor {
     this.initOutlineFilter();       // layout
     this.initRecentMenus();         // tabs
     this.initFolderSortControls();  // files
+    this.initFileTreeDragEvents();  // files：文件树拖放移动（指针事件，规避 Tauri 原生 DnD 接管）
     this.initViewControls();        // layout
     this.initDialogDismiss();       // misc-ui
     this.initWindowControls();      // updater
@@ -262,11 +263,25 @@ class MarkdownEditor {
     });
 
     // 应用退出时全量 revoke Blob URL，避免 WebView 存活期内泄漏（LRU 兜底外的一刀切）
-    window.addEventListener('beforeunload', () => {
+    window.addEventListener('beforeunload', (e) => {
       if (this._imageURLCache && typeof URL !== 'undefined' && URL.revokeObjectURL) {
         for (const url of this._imageURLCache.values()) URL.revokeObjectURL(url);
         this._imageURLCache.clear();
       }
+      // 未保存拦截：正常关闭走 handleAppClose 的保存对话框（托盘/标题栏 X），
+      // 但 WebView 崩溃/任务管理器强杀/窗口被销毁等路径不经过它，
+      // 会在此处静默丢掉未落盘内容。补一道浏览器级提示兜底。
+      // 注意：所见即所得模式下编辑最终仍落到 activeTab.content，
+      // 故 isModified 判定对三种模式一致有效。
+      try {
+        const modified = (this.tabs || []).filter(t => t.isModified);
+        if (modified.length > 0) {
+          e.preventDefault();
+          // 兼容旧内核：部分实现只认 returnValue
+          e.returnValue = '';
+          return '';
+        }
+      } catch (_) { /* 退出期任何异常都不应阻断关闭 */ }
     });
   }
 
@@ -294,6 +309,20 @@ class MarkdownEditor {
       case 'insert-highlight': this.wrapSelection('==', '=='); break;
       case 'insert-superscript': this.wrapSelection('<sup>', '</sup>'); break;
       case 'insert-subscript': this.wrapSelection('<sub>', '</sub>'); break;
+      // 内容类型补齐（2026-10-22 全量比对新增，面板默认不启用）：光标偏移=插入文本内
+      // 待填位置（insertBlock 口径），wrapSelection 空选区时插入空壳、光标落壳内。
+      case 'insert-dl': this.insertBlock('术语\n: 释义', 2); break;
+      case 'insert-details': this.insertBlock('<details>\n<summary>点击展开</summary>\n\n内容\n\n</details>', 35); break;
+      case 'insert-footnote': this.insertBlock('[^1]: 脚注内容', 6); break;
+      case 'insert-progress': this.insertBlock('<progress value="70" max="100"></progress>', 17); break;
+      case 'insert-center': this.insertBlock('<center>\n居中显示的文本\n</center>', 9); break;
+      case 'insert-u': this.wrapSelection('<u>', '</u>'); break;
+      case 'insert-ins': this.wrapSelection('<ins>', '</ins>'); break;
+      case 'insert-del': this.wrapSelection('<del>', '</del>'); break;
+      case 'insert-figure': this.insertBlock('<figure>\n  <img src="图片地址" alt="图片描述">\n  <figcaption>图注文字</figcaption>\n</figure>', 21); break;
+      case 'insert-kbd': this.wrapSelection('<kbd>', '</kbd>'); break;
+      case 'insert-abbreviation': this.wrapSelection('<abbr title="完整词">', '</abbr>'); break;
+      case 'insert-ruby': this.insertBlock('<ruby>文字<rt>拼音</rt></ruby>', 6); break;
 
       case 'insert-h1': this.applyHeadingLevel(1); break;
       case 'insert-h2': this.applyHeadingLevel(2); break;
@@ -369,13 +398,18 @@ Object.assign(MarkdownEditor.prototype, TMUpdater.mixin);
 Object.assign(MarkdownEditor.prototype, TMFormat.mixin);
 Object.assign(MarkdownEditor.prototype, TMCtxMenu.mixin);
 Object.assign(MarkdownEditor.prototype, TMSlash.mixin);
+Object.assign(MarkdownEditor.prototype, TMEmptyHint.mixin);
+Object.assign(MarkdownEditor.prototype, TMWysiwyg.mixin);
 Object.assign(MarkdownEditor.prototype, TMLifecycle.mixin);
 Object.assign(MarkdownEditor.prototype, TMToolbar.mixin);
 Object.assign(MarkdownEditor, TMExport.statics);
 
 
 function updateLoadingProgress(percent, text) {
-  document.getElementById('loading-progress-fill').style.width = Math.min(100, Math.max(0, percent)) + '%';
+  // 进度条元素只存在于启动 loading 界面；进入编辑器后（或测试 harness 未渲染 loading 屏时）
+  // 可能查不到。加空值守卫，避免异步进度回调抛 TypeError 中断启动流程。
+  const fill = document.getElementById('loading-progress-fill');
+  if (fill) fill.style.width = Math.min(100, Math.max(0, percent)) + '%';
   const textEl = document.getElementById('loading-text');
   if (textEl && text) textEl.textContent = text;
 }
